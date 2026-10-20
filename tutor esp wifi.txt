@@ -1,0 +1,118 @@
+Halo Mas Tyan,
+
+Berikut adalah panduan teknis & contoh cuplikan kode untuk menerapkan fitur "Auto-Connect & Fallback Wi-Fi" di modul ESP32 Master kita. 
+
+Tujuannya agar ESP32 bisa otomatis menyambung ke Hotspot HP Supir / Modem Bus yang kita input dari aplikasi headunit, dan jika hotspot tersebut mati, ESP32 otomatis kembali memancarkan Wi-Fi mandiri "Seat-Monitoring-Bus".
+
+Berikut langkah-langkah implementasinya di dalam kode ESP32:
+
+---
+
+### LANGKAH 1: Tambahkan Variabel Penyimpanan Wi-Fi di "variables.h"
+Gunakan library <Preferences.h> (yang sudah di-include Mas Tyan di variables.h) untuk menyimpan SSID & Password secara permanen ke memori flash ESP32 agar tidak hilang saat bus dimatikan.
+
+Tambahkan/sesuaikan variabel berikut di variables.h:
+--------------------------------------------------
+// Namespace penyimpanan NVS
+Preferences wifiPrefs;
+
+// Buffer sementara untuk SSID & Password aktif
+String active_STA_SSID = "";
+String active_STA_PASS = "";
+--------------------------------------------------
+
+
+### LANGKAH 2: Buat Fungsi Baca & Tulis Wi-Fi di NVS ("main.h")
+Tambahkan dua fungsi pembantu ini di main.h untuk menyimpan dan membaca data Wi-Fi:
+
+--------------------------------------------------
+// Fungsi untuk menyimpan SSID & Password baru ke memori permanen
+void saveWifiCredentials(String ssid, String pass) {
+  wifiPrefs.begin("wifi_creds", false); // false = read-write
+  wifiPrefs.putString("ssid", ssid);
+  wifiPrefs.putString("pass", pass);
+  wifiPrefs.end();
+  Serial.println("[NVS] Kredensial Wi-Fi baru berhasil disimpan!");
+}
+
+// Fungsi untuk membaca SSID & Password yang tersimpan saat booting
+void loadWifiCredentials() {
+  wifiPrefs.begin("wifi_creds", true); // true = read-only
+  active_STA_SSID = wifiPrefs.getString("ssid", ""); // default kosong jika belum ada
+  active_STA_PASS = wifiPrefs.getString("pass", "");
+  wifiPrefs.end();
+  Serial.printf("[NVS] Membaca kredensial tersimpan: SSID='%s'\n", active_STA_SSID.c_str());
+}
+--------------------------------------------------
+
+
+### LANGKAH 3: Ubah Logika wifiInit() untuk Mendukung Auto-Connect & Fallback
+Ganti fungsi wifiInit() lama di main.h agar saat booting awal, ESP32 otomatis membaca NVS dan mencoba menyambung ke Hotspot Supir terlebih dahulu selama maksimal 15 detik sebelum fallback:
+
+--------------------------------------------------
+static void wifiInit() {
+  WiFi.setHostname("bus-led");
+  
+  // 1. Baca kredensial Wi-Fi terakhir dari NVS
+  loadWifiCredentials();
+
+  // 2. Set mode ke AP + STA agar bisa tersambung ke hotspot sekaligus memancarkan Wi-Fi ke seat
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ap_ssid, ap_password, 1, 0, 8); // AP Mandiri tetap menyala di channel 1
+  Serial.printf("[AP] SSID: %s | IP: %s\n", ap_ssid, WiFi.softAPIP().toString().c_str());
+
+  // mDNS responder
+  if (MDNS.begin("bus-led")) {
+    MDNS.addService("ws", "tcp", 81);
+    Serial.println("[mDNS] Responder siap: bus-led.local");
+  }
+
+  // 3. Jika ada Wi-Fi tersimpan, coba hubungkan secara non-blocking selama 15 detik
+  if (active_STA_SSID.length() > 0) {
+    Serial.printf("[STA] Mencoba menyambung ke Hotspot: %s ...\n", active_STA_SSID.c_str());
+    WiFi.begin(active_STA_SSID.c_str(), active_STA_PASS.c_str());
+    
+    int timeoutCounter = 0;
+    while (WiFi.status() != WL_CONNECTED && timeoutCounter < 30) { // 30 * 500ms = 15 detik
+      delay(500);
+      Serial.print(".");
+      timeoutCounter++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("\n[STA] BERHASIL tersambung! IP lokal: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+      Serial.println("\n[STA] Koneksi RTO/Gagal. Fallback otomatis ke AP lokal saja.");
+      WiFi.disconnect(); // Putuskan koneksi STA agar tidak membebani memori, AP tetap aktif!
+    }
+  } else {
+    Serial.println("[STA] Belum ada kredensial Wi-Fi tersimpan. Menunggu perintah dari Headunit.");
+  }
+}
+--------------------------------------------------
+
+
+### LANGKAH 4: Simpan Kredensial Saat Menerima Perintah dari Headunit
+Pada fungsi onWsEvent() di bagian penanganan perintah wifiConnect (sekitar baris 518 di main.h), tambahkan logika pemanggilan fungsi saveWifiCredentials agar kredensial baru langsung disimpan:
+
+--------------------------------------------------
+      } else if (msg.indexOf("\"action\":\"wifiConnect\"") >= 0) {
+        String ssid, pass;
+        int sIdx = msg.indexOf("\"ssid\":\"");
+        if (sIdx >= 0) ssid = msg.substring(sIdx + 8, msg.indexOf("\"", sIdx + 8));
+        int pIdx = msg.indexOf("\"pass\":\"");
+        if (pIdx >= 0) pass = msg.substring(pIdx + 8, msg.indexOf("\"", pIdx + 8));
+        
+        // SIMPAN KE NVS agar saat bus dimatikan/dihidupkan lagi tetap ingat hotspot ini
+        if (ssid.length() > 0) {
+          saveWifiCredentials(ssid, pass);
+        }
+        
+        staConnect(ssid, pass);
+        webSocket.sendTXT(num, "{\"status\":\"wifi\",\"state\":\"connecting\"}");
+      }
+--------------------------------------------------
+
+Mas Tyan bisa langsung menyalin logika di atas. Dengan metode ini, instalasi Wi-Fi di bus akan sangat fleksibel dan supir bisa leluasa mengganti hotspot lewat Headunit tanpa perlu memprogram ulang ESP32.
+
+Terima kasih banyak, Mas Tyan!
