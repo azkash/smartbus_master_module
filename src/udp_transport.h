@@ -51,6 +51,7 @@ static void udpHandleSeat(JsonDocument& doc, const IPAddress& remoteIp,
   const bool seatbelt = doc["seatbelt"] | false;
   const uint32_t session = doc["session"] | 0U;
   const uint32_t seq = doc["seq"] | 0U;
+  const uint16_t pressure = doc["pressure"] | (occupied ? 800 : 0);
 
   if (strlen(uid) != 12 || seq == 0 || session == 0) {
     Serial.printf("[UDP] invalid seat packet from %s\n", remoteIp.toString().c_str());
@@ -63,7 +64,7 @@ static void udpHandleSeat(JsonDocument& doc, const IPAddress& remoteIp,
   const bool unassigned = strcmp(id, "RandomID") == 0 ||
                           (doc["unassigned"] | false);
   if (unassigned) {
-    if (state) {
+    if (state || occupied) {
       const int slot = pairingRememberUdp(uid, remoteIp, remotePort);
       if (slot < 0) {
         Serial.println("[Pairing] pending table full");
@@ -83,6 +84,10 @@ static void udpHandleSeat(JsonDocument& doc, const IPAddress& remoteIp,
   }
 
   SeatInfo& seat = seats[slot];
+  if (strlen(uid) == 12) {
+    strlcpy(seat.uid, uid, sizeof(seat.uid));
+  }
+  seat.pressure = pressure;
   const bool sameSession = seat.hasUdpSeq && seat.udpSession == session;
   const bool duplicateOrOld = sameSession &&
                               static_cast<int32_t>(seq - seat.udpSeq) <= 0;

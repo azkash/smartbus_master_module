@@ -154,6 +154,7 @@ static_assert(MAX_SEATS >= 50, "Production SmartBus requires at least 50 seat sl
 
 struct SeatInfo {
   char          id[32];
+  char          uid[16];
   bool          occupied;
   bool          calling;      // instantaneous: last reported sensorState (button held)
   bool          callPending;  // latched: a call was raised, not yet acknowledged
@@ -169,6 +170,7 @@ struct SeatInfo {
   uint32_t      udpSession;    // changes whenever a seat reboots
   uint32_t      udpSeq;        // last accepted packet in that session
   bool          hasUdpSeq;
+  uint16_t      pressure;      // ADC reading from seat FSR
 };
 static SeatInfo seats[MAX_SEATS];
 
@@ -241,6 +243,28 @@ static bool rosterClear(const char* id) {
   return false;
 }
 
+// Delete/unpair a seat from the roster.
+static bool rosterDelete(const char* id) {
+  for (int i = 0; i < MAX_SEATS; i++) {
+    if (seats[i].used && strcasecmp(seats[i].id, id) == 0) {
+      Serial.printf("[Roster] seat %s removed from roster\n", seats[i].id);
+      seats[i].used = false;
+      seats[i].id[0] = '\0';
+      seats[i].uid[0] = '\0';
+      seats[i].online = false;
+      seats[i].calling = false;
+      seats[i].callPending = false;
+      seats[i].occupied = false;
+      seats[i].seatbeltAlert = false;
+      seats[i].viaUdp = false;
+      seats[i].sourceIp = IPAddress();
+      seats[i].hasUdpSeq = false;
+      return true;
+    }
+  }
+  return false;
+}
+
 // Build a JSON array of all known seats with full state fields.
 // e.g. [{"id":"1A","occupied":false,"calling":false,"callPending":true,"online":true}]
 static String rosterJson() {
@@ -255,6 +279,7 @@ static String rosterJson() {
     // Never expose stale state to the head unit. If the seat controller stops
     // reporting, its last "occupied" sample must not remain visible forever.
     obj["occupied"]    = isOnline && seats[i].occupied;
+    obj["pressure"]    = isOnline ? seats[i].pressure : 0;
     obj["calling"]     = isOnline && seats[i].calling;
     obj["callPending"] = seats[i].callPending;
     obj["online"]      = isOnline;
@@ -1007,9 +1032,9 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
         const bool unassigned = strcmp(id, "RandomID") == 0 ||
                                 msg.indexOf("\"unassigned\":true") >= 0;
         if (unassigned) {
-          // Heartbeats register connectivity but only a real button call opens
+          // Heartbeats register connectivity; a button call or seat sensor/FSR opens
           // the popup, as requested by the provisioning workflow.
-          if (state && strlen(uid) == 12) {
+          if ((state || occupied) && strlen(uid) == 12) {
             int slot = pairingRemember(uid, num);
             if (slot < 0) {
               Serial.println("[Pairing] pending table full");
@@ -1097,6 +1122,54 @@ void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
           if (!dispatched) Serial.println("[Pairing] UDP dispatch failed");
         }
         webSocket.sendTXT(num, response);
+
+      } else if (msg.indexOf("\"action\":\"unpairSeat\"") >= 0 ||
+                 msg.indexOf("\"action\":\"clearSeatId\"") >= 0) {
+        StaticJsonDocument<256> doc;
+        deserializeJson(doc, msg);
+        const char* targetId = doc["id"] | "";
+        if (targetId[0] != '\0') {
+          char cmd[160];
+          char targetUid[16] = {0};
+          IPAddress seatIp;
+          bool hasSeatIp = false;
+
+          for (int i = 0; i < MAX_SEATS; i++) {
+            if (seats[i].used && strcasecmp(seats[i].id, targetId) == 0) {
+              if (seats[i].viaUdp && seats[i].sourceIp != IPAddress()) {
+                seatIp = seats[i].sourceIp;
+                hasSeatIp = true;
+              }
+              if (seats[i].uid[0] != '\0') {
+                strlcpy(targetUid, seats[i].uid, sizeof(targetUid));
+              }
+              break;
+            }
+          }
+
+          if (targetUid[0] != '\0') {
+            snprintf(cmd, sizeof(cmd), "{\"action\":\"clearSeatId\",\"id\":\"%s\",\"uid\":\"%s\"}", targetId, targetUid);
+          } else {
+            snprintf(cmd, sizeof(cmd), "{\"action\":\"clearSeatId\",\"id\":\"%s\"}", targetId);
+          }
+
+          const IPAddress broadcastIp = WiFi.localIP() | ~WiFi.subnetMask();
+          // Seat client listens on port 5759 (SEAT_UDP_PORT). Send 3x burst for WiFi reliability.
+          for (int r = 0; r < 3; r++) {
+            if (hasSeatIp) {
+              udpSendJson(seatIp, 5759, cmd);
+            }
+            udpSendJson(broadcastIp, 5759, cmd);
+            udpSendJson(broadcastIp, SMARTBUS_UDP_PORT, cmd);
+            delay(15);
+          }
+
+          webSocket.broadcastTXT(cmd);
+          rosterDelete(targetId);
+          String roster = rosterJson();
+          webSocket.broadcastTXT(roster);
+          Serial.printf("[Pairing] seat '%s' (UID %s) unpaired, clearSeatId dispatched & broadcast\n", targetId, targetUid);
+        }
 
       } else if (msg == "roster") {
         String roster = rosterJson();
